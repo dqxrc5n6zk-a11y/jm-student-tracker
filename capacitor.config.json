@@ -1,0 +1,10 @@
+{
+  "appId": "com.jmtperformance.app",
+  "appName": "JMT Performance",
+  "webDir": "dist",
+  "packageClassList": [
+    "BluetoothLe",
+    "HapticsPlugin",
+    "VideoRecorderPlugin"
+  ]
+}
