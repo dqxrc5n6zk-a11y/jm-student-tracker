@@ -12,9 +12,9 @@ let package = Package(
     ],
     dependencies: [
         .package(name: "capacitor-swift-pm", path: "../capacitor-swift-pm-local"),
-        .package(name: "CapacitorCommunityBluetoothLe", path: "../../../node_modules/@capacitor-community/bluetooth-le"),
-        .package(name: "CapacitorBrowser", path: "../../../node_modules/@capacitor/browser"),
-        .package(name: "CapacitorHaptics", path: "../../../node_modules/@capacitor/haptics")
+        .package(name: "CapacitorCommunityBluetoothLe", path: "../CapacitorCommunityBluetoothLeLocal"),
+        .package(name: "CapacitorBrowser", path: "../CapacitorBrowserLocal"),
+        .package(name: "CapacitorHaptics", path: "../CapacitorHapticsLocal")
     ],
     targets: [
         .target(
