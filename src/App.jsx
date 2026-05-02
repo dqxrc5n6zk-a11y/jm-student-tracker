@@ -738,19 +738,6 @@ function buildGoogleDriveDownloadUrl(fileId) {
   return `https://drive.google.com/uc?export=download&id=${normalizedId}`;
 }
 
-async function pushNativeRecordingStats({ shots = 0, totalTime = 0 } = {}) {
-  if (!Capacitor.isNativePlatform()) return;
-
-  try {
-    await NativeVideoRecorder.updateRecordingStats({
-      shots: Number(shots || 0),
-      totalTime: Number(totalTime || 0),
-    });
-  } catch (error) {
-    console.error("Update native recording stats failed:", error);
-  }
-}
-
 async function apiGet(action) {
   try {
     const res = await fetch(`${API_BASE}?action=${action}`);
@@ -1556,6 +1543,7 @@ const discardCurrentTimerRunRef = useRef(false);
 
 const isSavingRef = useRef(false);
 const videoInputRef = useRef(null);
+const currentShotsRef = useRef([]);
 const lastShotSnapshotRef = useRef([]);
 const videoCaptureSessionRef = useRef({
   active: false,
@@ -1569,6 +1557,34 @@ const runVideoTouchStartYRef = useRef(null);
 const runVideoTouchCurrentYRef = useRef(null);
 
   const [darkMode, setDarkMode] = useState(true);
+
+  async function pushNativeRecordingStats({ shots = 0, totalTime = 0 } = {}) {
+    if (!Capacitor.isNativePlatform()) return;
+
+    const shouldSyncNativeRecordingStats =
+      nativeVideoModeOpen ||
+      videoCaptureSessionRef.current.active ||
+      videoCaptureSessionRef.current.awaitingStop ||
+      videoCaptureSessionRef.current.pendingFinalize ||
+      Boolean(videoCaptureSessionRef.current.recordedMeta);
+
+    if (!shouldSyncNativeRecordingStats) {
+      return;
+    }
+
+    try {
+      if (typeof NativeVideoRecorder?.updateRecordingStats !== "function") {
+        return;
+      }
+
+      await NativeVideoRecorder.updateRecordingStats({
+        shots: Number(shots || 0),
+        totalTime: Number(totalTime || 0),
+      });
+    } catch (error) {
+      console.error("Update native recording stats failed:", error);
+    }
+  }
 
   function closeRunVideoPlayer() {
     setActiveRunVideo(null);
@@ -2091,6 +2107,7 @@ const [eventDisplayCoursesLoading, setEventDisplayCoursesLoading] = useState(fal
 const eventDisplayRecentCloseTimeoutRef = useRef(null);
 const eventDisplayStagesCloseTimeoutRef = useRef(null);
 const [activeMatch, setActiveMatch] = useState(() => readStoredJson(MATCH_STORAGE_KEY, null));
+const activeMatchRef = useRef(readStoredJson(MATCH_STORAGE_KEY, null));
 const [matchHistory, setMatchHistory] = useState(() => readStoredJson(MATCH_HISTORY_STORAGE_KEY, []));
 const [matchNameInput, setMatchNameInput] = useState("");
 const [matchDrillId, setMatchDrillId] = useState("");
@@ -2460,6 +2477,10 @@ useEffect(() => {
 }, []);
 
 useEffect(() => {
+  activeMatchRef.current = activeMatch;
+}, [activeMatch]);
+
+useEffect(() => {
   try {
     if (activeMatch) {
       localStorage.setItem(MATCH_STORAGE_KEY, JSON.stringify(activeMatch));
@@ -2587,7 +2608,7 @@ useEffect(() => {
           awaitingStop: false,
         };
 
-        currentShots = [];
+        currentShotsRef.current = [];
         lastShotSnapshotRef.current = [];
         setLiveShotTimes([]);
         setVideoStatus("Cancelling run and stopping timer...");
@@ -2656,7 +2677,7 @@ useEffect(() => {
         const shouldStopTimer = videoCaptureSessionRef.current.active || videoCaptureSessionRef.current.awaitingStop || timerRunning;
 
         setNativeVideoModeOpen(false);
-        currentShots = [];
+        currentShotsRef.current = [];
         lastShotSnapshotRef.current = [];
         setLiveShotTimes([]);
         videoCaptureSessionRef.current = {
@@ -2710,15 +2731,27 @@ useEffect(() => {
 
 function handleNativeTimerBytes(bytes) {
   try {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+      console.warn("handleNativeTimerBytes received empty payload", bytes);
+      return;
+    }
+
     const event = {
       target: {
-        value: new DataView(bytes.buffer.slice(0)),
+        // Preserve the exact byte window received from native BLE notifications.
+        value: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
       },
     };
 
     handleTimerEvent(event);
   } catch (err) {
-    console.error("handleNativeTimerBytes error:", err);
+    const details = {
+      name: err?.name || "",
+      message: err?.message || "",
+      stack: err?.stack || "",
+      bytes: Array.from(bytes || []),
+    };
+    console.error("handleNativeTimerBytes error:", JSON.stringify(details));
   }
 }
 
@@ -3158,6 +3191,7 @@ async function startTimer() {
         startCommand
       );
 
+      setTimerRunning(true);
       setTimerStatusMessage("Start command sent");
       return;
     }
@@ -3165,6 +3199,7 @@ async function startTimer() {
     setTimerStatusMessage("Start is only set up for native right now");
   } catch (err) {
     console.error("Start timer error:", JSON.stringify(err), err);
+    setTimerRunning(false);
     setTimerStatusMessage("Start failed");
   }
 }
@@ -3190,6 +3225,7 @@ async function stopTimer() {
         stopCommand
       );
 
+      setTimerRunning(false);
       setTimerStatusMessage("Stop command sent");
       return;
     }
@@ -3756,6 +3792,23 @@ function clearRunForm() {
     }
   }
 
+  function updateActiveMatchSelectionField(field, value) {
+    const normalizedField = String(field || "").trim();
+    const normalizedValue = String(value || "").trim();
+
+    const currentMatch = activeMatchRef.current;
+    if (!currentMatch || !normalizedField) return;
+
+    const nextMatch = {
+      ...currentMatch,
+      [normalizedField]: normalizedValue,
+      updatedAt: new Date().toISOString(),
+    };
+
+    activeMatchRef.current = nextMatch;
+    setActiveMatch(nextMatch);
+  }
+
   function addShooterToMatchRoster(shooterId) {
     const normalizedId = String(shooterId || "").trim();
     if (!normalizedId) return;
@@ -3809,7 +3862,11 @@ function clearRunForm() {
 
     setActiveMatch(nextMatch);
     syncMatchSelection(nextMatch);
-    resetMatchBuilder();
+    resetMatchBuilder({
+      keepDrill: true,
+      keepSession: true,
+      keepRoster: true,
+    });
     setSelectorOpen(null);
     clearRunForm();
     setMessage(`Match started. ${findItemById(shooters, nextMatch.shooterIds[0], "ShooterID")?.Name || "First shooter"} is up.`);
@@ -4060,23 +4117,58 @@ function clearRunForm() {
     }
   }
 
-  function resetMatchBuilder() {
+  function resetMatchBuilder({
+    keepDrill = false,
+    keepSession = false,
+    keepRoster = false,
+  } = {}) {
     setMatchNameInput("");
-    setMatchDrillId(defaultMatchDrillId);
-    setMatchSessionId(defaultMatchSessionId);
+    setMatchDrillId(keepDrill ? matchDrillId : defaultMatchDrillId);
+    setMatchSessionId(keepSession ? matchSessionId : defaultMatchSessionId);
     setMatchShooterSearch("");
-    setMatchRosterIds([]);
+    setMatchRosterIds(keepRoster ? matchRosterIds : []);
+  }
+
+  function getNextPendingMatchIndex(
+    match,
+    startIndex,
+    results,
+    { includeCurrent = false } = {}
+  ) {
+    const shooterIds = Array.isArray(match?.shooterIds) ? match.shooterIds : [];
+    if (shooterIds.length === 0) return -1;
+
+    const completedShooterIds = new Set(
+      (Array.isArray(results) ? results : [])
+        .map((entry) => String(entry?.shooterId || "").trim())
+        .filter(Boolean)
+    );
+
+    const normalizedStartIndex =
+      Number.isFinite(Number(startIndex)) && Number(startIndex) >= 0
+        ? Number(startIndex)
+        : 0;
+
+    for (let offset = includeCurrent ? 0 : 1; offset < shooterIds.length; offset += 1) {
+      const candidateIndex = (normalizedStartIndex + offset) % shooterIds.length;
+      const candidateShooterId = String(shooterIds[candidateIndex] || "").trim();
+      if (!candidateShooterId) continue;
+      if (!completedShooterIds.has(candidateShooterId)) {
+        return candidateIndex;
+      }
+    }
+
+    return -1;
   }
 
   function handleMatchRunSaved(savedRun) {
-    if (!activeMatch) return;
+    const currentMatchState = activeMatchRef.current;
+    if (!currentMatchState) return;
 
-    const currentIndex = Number(activeMatch.currentIndex || 0);
-    const currentShooterId = String(activeMatch.shooterIds?.[currentIndex] || "");
-    const nextIndex = currentIndex + 1;
-    const nextShooterId = String(activeMatch.shooterIds?.[nextIndex] || "");
+    const currentIndex = Number(currentMatchState.currentIndex || 0);
+    const currentShooterId = String(currentMatchState.shooterIds?.[currentIndex] || "");
     const nextResults = [
-      ...(activeMatch.results || []).filter(
+      ...(currentMatchState.results || []).filter(
         (entry) => String(entry.shooterId) !== currentShooterId
       ),
       {
@@ -4088,20 +4180,25 @@ function clearRunForm() {
       },
     ];
 
-    if (!nextShooterId) {
+    const nextIndex = getNextPendingMatchIndex(currentMatchState, currentIndex, nextResults);
+    const nextShooterId =
+      nextIndex >= 0 ? String(currentMatchState.shooterIds?.[nextIndex] || "") : "";
+
+    if (nextIndex === -1 || !nextShooterId) {
       finishMatch({ silent: true });
-      setMessage(`Match complete. ${activeMatch.name} is finished.`);
+      setMessage(`Match complete. ${currentMatchState.name} is finished.`);
       clearRunForm();
       return;
     }
 
     const nextMatch = {
-      ...activeMatch,
+      ...currentMatchState,
       currentIndex: nextIndex,
       results: nextResults,
       updatedAt: new Date().toISOString(),
     };
 
+    activeMatchRef.current = nextMatch;
     setActiveMatch(nextMatch);
     syncMatchSelection(nextMatch);
     clearRunForm();
@@ -4114,24 +4211,80 @@ function clearRunForm() {
     );
   }
 
+  function setCurrentMatchShooter(shooterId) {
+    const currentMatchState = activeMatchRef.current;
+    if (!currentMatchState) return;
+
+    const normalizedShooterId = String(shooterId || "").trim();
+    if (!normalizedShooterId) return;
+
+    const nextIndex = currentMatchState.shooterIds.findIndex(
+      (item) => String(item) === normalizedShooterId
+    );
+    if (nextIndex === -1) return;
+
+    const nextResults = (currentMatchState.results || []).filter((entry) => {
+      const resultShooterId = String(entry?.shooterId || "");
+      const resultIndex = currentMatchState.shooterIds.findIndex(
+        (item) => String(item) === resultShooterId
+      );
+      return resultIndex !== -1 && resultIndex < nextIndex;
+    });
+
+    const nextMatch = {
+      ...currentMatchState,
+      currentIndex: nextIndex,
+      results: nextResults,
+      updatedAt: new Date().toISOString(),
+    };
+
+    activeMatchRef.current = nextMatch;
+    setActiveMatch(nextMatch);
+    syncMatchSelection(nextMatch);
+    clearRunForm();
+    setMessage(
+      `${findItemById(shooters, normalizedShooterId, "ShooterID")?.Name || "Selected shooter"} is now up. Match will continue from there.`
+    );
+  }
+
   function skipCurrentMatchShooter() {
-    if (!activeMatch) return;
+    const currentMatchState = activeMatchRef.current;
+    if (!currentMatchState) return;
 
-    const nextIndex = Number(activeMatch.currentIndex || 0) + 1;
-    const nextShooterId = String(activeMatch.shooterIds?.[nextIndex] || "");
+    const currentIndex = Number(currentMatchState.currentIndex || 0);
+    const nextIndex = getNextPendingMatchIndex(
+      currentMatchState,
+      currentIndex,
+      currentMatchState.results || []
+    );
+    const nextShooterId =
+      nextIndex >= 0 ? String(currentMatchState.shooterIds?.[nextIndex] || "") : "";
 
-    if (!nextShooterId) {
+    if (nextIndex === -1 || !nextShooterId) {
+      const currentShooterId = String(currentMatchState.shooterIds?.[currentIndex] || "");
+      const currentAlreadySaved = (currentMatchState.results || []).some(
+        (entry) => String(entry?.shooterId || "") === currentShooterId
+      );
+
+      if (!currentAlreadySaved && currentShooterId) {
+        setMessage(
+          `${activeMatchCurrentShooter?.Name || "Current shooter"} is the only shooter left without a saved run.`
+        );
+        return;
+      }
+
       finishMatch({ silent: true });
-      setMessage(`Match complete. ${activeMatch.name} is finished.`);
+      setMessage(`Match complete. ${currentMatchState.name} is finished.`);
       return;
     }
 
     const nextMatch = {
-      ...activeMatch,
+      ...currentMatchState,
       currentIndex: nextIndex,
       updatedAt: new Date().toISOString(),
     };
 
+    activeMatchRef.current = nextMatch;
     setActiveMatch(nextMatch);
     syncMatchSelection(nextMatch);
     clearRunForm();
@@ -6700,13 +6853,22 @@ const getRowStyle = (index) => ({
       characteristic,
       (value) => {
         try {
-          const bytes = new Uint8Array(value.buffer);
-          // console.log("NATIVE TIMER RAW BYTES:", Array.from(bytes));
-          handleNativeTimerBytes(bytes);
+          const bytes =
+            value instanceof DataView
+              ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+              : value instanceof Uint8Array
+              ? value
+              : new Uint8Array(value?.buffer || value);
 
-          // We will hook this into your existing parser next.
+          handleNativeTimerBytes(bytes);
         } catch (err) {
-          console.error("Native notification parse error:", err);
+          console.error("Native notification parse error:", {
+            name: err?.name,
+            message: err?.message,
+            stack: err?.stack,
+            raw: err,
+            value,
+          });
         }
       }
     );
@@ -6795,294 +6957,380 @@ setTimerStatusMessage("Ready");
     alert("Bluetooth error: " + err.message);
   }
 }
-let currentShots = [];
-
 function handleTimerEvent(event) {
   const value = event.target.value; // This is already a DataView
+
+  if (!(value instanceof DataView) || value.byteLength < 2) {
+    console.warn("Ignoring timer event with invalid payload", value);
+    return;
+  }
 
   const eventId = value.getUint8(1);
 
   // SESSION_STARTED or SESSION_SET_BEGIN
  if (eventId === 0x00 || eventId === 0x05) {
-  currentShots = [];
-  lastShotSnapshotRef.current = [];
-  discardCurrentTimerRunRef.current = false;
-  setLiveShotTimes([]);
-  setTimerRunning(true);
-  pushNativeRecordingStats({ shots: 0, totalTime: 0 });
-  console.log("Session started / set begin");
-  return;
+  try {
+    console.log("Timer start packet received", {
+      eventId,
+      byteLength: value.byteLength,
+    });
+    currentShotsRef.current = [];
+    console.log("Timer start: cleared currentShots");
+    lastShotSnapshotRef.current = [];
+    console.log("Timer start: cleared lastShotSnapshotRef");
+    discardCurrentTimerRunRef.current = false;
+    console.log("Timer start: cleared discard flag");
+    setLiveShotTimes([]);
+    console.log("Timer start: cleared live shot times");
+    setTimerRunning(true);
+    console.log("Timer start: set timerRunning true");
+    pushNativeRecordingStats({ shots: 0, totalTime: 0 });
+    console.log("Session started / set begin");
+    return;
+  } catch (error) {
+    const details = {
+      phase: "session-start",
+      eventId,
+      message: error?.message || "",
+      stack: error?.stack || "",
+    };
+    console.error("handleTimerEvent session-start error:", JSON.stringify(details));
+    throw error;
+  }
 }
 
   // SHOT_DETECTED
 if (eventId === 0x04) {
+  if (value.byteLength < 12) {
+    console.warn("Ignoring short shot packet", {
+      eventId,
+      byteLength: value.byteLength,
+    });
+    return;
+  }
+
   const shotNum = value.getUint16(6, false);
   const rawTime = value.getUint32(8, false);
   const seconds = Number((rawTime / 1000).toFixed(3));
 
   console.log("Shot detected parsed:", { shotNum, rawTime, seconds });
 
-  if (seconds > 0 && Number.isFinite(seconds)) {
-  currentShots.push(seconds);
-  lastShotSnapshotRef.current = [...currentShots];
-  setLiveShotTimes([...currentShots]);
-  pushNativeRecordingStats({ shots: currentShots.length, totalTime: seconds });
-}
+  try {
+    if (seconds > 0 && Number.isFinite(seconds)) {
+      currentShotsRef.current.push(seconds);
+      console.log("Shot packet: pushed currentShots", [...currentShotsRef.current]);
+      lastShotSnapshotRef.current = [...currentShotsRef.current];
+      console.log("Shot packet: updated lastShotSnapshotRef");
+      setLiveShotTimes([...currentShotsRef.current]);
+      console.log("Shot packet: updated live shot times");
+      pushNativeRecordingStats({
+        shots: currentShotsRef.current.length,
+        totalTime: seconds,
+      });
+      console.log("Shot packet: updated native recording stats");
+    }
+  } catch (error) {
+    const details = {
+      phase: "shot-detected",
+      shotNum,
+      rawTime,
+      seconds,
+      message: error?.message || "",
+      stack: error?.stack || "",
+    };
+    console.error("handleTimerEvent shot-detected error:", JSON.stringify(details));
+    throw error;
+  }
 
   return;
 }
 
   // SESSION_STOPPED
   if (eventId === 0x03) {
-  console.log("Session ended");
-  setTimerRunning(false);
-  lastShotSnapshotRef.current = [...currentShots];
-  const finalTotalTime = currentShots.length > 0 ? currentShots[currentShots.length - 1] : 0;
-  pushNativeRecordingStats({ shots: currentShots.length, totalTime: finalTotalTime });
-  if (discardCurrentTimerRunRef.current || videoCaptureSessionRef.current.discardPending) {
-    currentShots = [];
-    lastShotSnapshotRef.current = [];
-    setLiveShotTimes([]);
-    discardCurrentTimerRunRef.current = false;
-    videoCaptureSessionRef.current = {
-      ...videoCaptureSessionRef.current,
-      active: false,
-      awaitingStop: false,
-      pendingFinalize: false,
-      discardPending: false,
-      recordedMeta: null,
+  try {
+    console.log("Session ended");
+    setTimerRunning(false);
+    console.log("Session stop: set timerRunning false");
+    lastShotSnapshotRef.current = [...currentShotsRef.current];
+    console.log("Session stop: captured lastShotSnapshotRef");
+    const finalTotalTime =
+      currentShotsRef.current.length > 0
+        ? currentShotsRef.current[currentShotsRef.current.length - 1]
+        : 0;
+    pushNativeRecordingStats({
+      shots: currentShotsRef.current.length,
+      totalTime: finalTotalTime,
+    });
+    console.log("Session stop: updated native recording stats");
+    if (discardCurrentTimerRunRef.current || videoCaptureSessionRef.current.discardPending) {
+      currentShotsRef.current = [];
+      lastShotSnapshotRef.current = [];
+      setLiveShotTimes([]);
+      discardCurrentTimerRunRef.current = false;
+      videoCaptureSessionRef.current = {
+        ...videoCaptureSessionRef.current,
+        active: false,
+        awaitingStop: false,
+        pendingFinalize: false,
+        discardPending: false,
+        recordedMeta: null,
+      };
+      setVideoStatus("Video mode cancelled. Run discarded.");
+      return;
+    }
+    if (videoCaptureSessionRef.current.awaitingStop) {
+      videoCaptureSessionRef.current = {
+        ...videoCaptureSessionRef.current,
+        pendingFinalize: true,
+      };
+      return;
+    }
+    finalizeRun();
+  } catch (error) {
+    const details = {
+      phase: "session-stop",
+      shotCount: currentShotsRef.current.length,
+      message: error?.message || "",
+      stack: error?.stack || "",
     };
-    setVideoStatus("Video mode cancelled. Run discarded.");
-    return;
+    console.error("handleTimerEvent session-stop error:", JSON.stringify(details));
+    throw error;
   }
-  if (videoCaptureSessionRef.current.awaitingStop) {
-    videoCaptureSessionRef.current = {
-      ...videoCaptureSessionRef.current,
-      pendingFinalize: true,
-    };
-    return;
-  }
-  finalizeRun();
 }
 }
 async function finalizeRun() {
-  const finalizedShotsSource =
-    currentShots.length > 0 ? currentShots : lastShotSnapshotRef.current;
+  try {
+    const finalizedShotsSource =
+      currentShotsRef.current.length > 0
+        ? currentShotsRef.current
+        : lastShotSnapshotRef.current;
 
-  console.log("finalizeRun invoked", {
-    shotCount: finalizedShotsSource.length,
-    selectedShooter: selectedShooterRef.current,
-    selectedDrill: selectedDrillRef.current,
-    selectedSession: selectedSessionRef.current,
-    recordedMeta: videoCaptureSessionRef.current.recordedMeta,
-  });
+    console.log("finalizeRun invoked", {
+      shotCount: finalizedShotsSource.length,
+      selectedShooter: selectedShooterRef.current,
+      selectedDrill: selectedDrillRef.current,
+      selectedSession: selectedSessionRef.current,
+      recordedMeta: videoCaptureSessionRef.current.recordedMeta,
+    });
 
-  if (finalizedShotsSource.length === 0) return;
+    if (finalizedShotsSource.length === 0) return;
 
-  const shotTimes = [...finalizedShotsSource]
-    .map(Number)
-    .filter((n) => !Number.isNaN(n) && n > 0);
+    const shotTimes = [...finalizedShotsSource]
+      .map(Number)
+      .filter((n) => !Number.isNaN(n) && n > 0);
 
-  if (shotTimes.length === 0) return;
+    if (shotTimes.length === 0) return;
 
-  const totalTime = shotTimes[shotTimes.length - 1];
-  const firstShot = shotTimes[0];
+    const totalTime = shotTimes[shotTimes.length - 1];
+    const firstShot = shotTimes[0];
 
-  const splitTimes = [];
-  for (let i = 1; i < shotTimes.length; i++) {
-    splitTimes.push(Number((shotTimes[i] - shotTimes[i - 1]).toFixed(3)));
-  }
+    const splitTimes = [];
+    for (let i = 1; i < shotTimes.length; i++) {
+      splitTimes.push(Number((shotTimes[i] - shotTimes[i - 1]).toFixed(3)));
+    }
 
-  const avgSplit =
-    splitTimes.length > 0
-      ? formatSplitCellValue((splitTimes.reduce((a, b) => a + b, 0) / splitTimes.length).toFixed(3))
-      : "";
+    const avgSplit =
+      splitTimes.length > 0
+        ? formatSplitCellValue((splitTimes.reduce((a, b) => a + b, 0) / splitTimes.length).toFixed(3))
+        : "";
 
-  const bestSplit =
-    splitTimes.length > 0 ? formatSplitCellValue(Math.min(...splitTimes).toFixed(3)) : "";
+    const bestSplit =
+      splitTimes.length > 0 ? formatSplitCellValue(Math.min(...splitTimes).toFixed(3)) : "";
 
-  const worstSplit =
-    splitTimes.length > 0 ? formatSplitCellValue(Math.max(...splitTimes).toFixed(3)) : "";
+    const worstSplit =
+      splitTimes.length > 0 ? formatSplitCellValue(Math.max(...splitTimes).toFixed(3)) : "";
 
-  const splitsRaw = splitTimes.map((time) => formatSplitForExport(time)).join(", ");
+    const splitsRaw = splitTimes.map((time) => formatSplitForExport(time)).join(", ");
 
-  const drill = findItemById(drillsRef.current, selectedDrillRef.current, "DrillID");
-  const passTime = Number(drill?.PassTime || 0);
+    const drill = findItemById(drillsRef.current, selectedDrillRef.current, "DrillID");
+    const passTime = Number(drill?.PassTime || 0);
 
-  let scoreValue = "";
-  let computedPassFail = "";
+    let scoreValue = "";
+    let computedPassFail = "";
 
-  if (passTime > 0) {
-    const overPar = Math.max(0, totalTime - passTime);
-    const deductionSteps = Math.ceil(overPar / 0.1);
-    scoreValue = Math.max(0, 100 - deductionSteps * 5);
-    computedPassFail = totalTime <= passTime ? "Pass" : "Fail";
-  }
+    if (passTime > 0) {
+      const overPar = Math.max(0, totalTime - passTime);
+      const deductionSteps = Math.ceil(overPar / 0.1);
+      scoreValue = Math.max(0, 100 - deductionSteps * 5);
+      computedPassFail = totalTime <= passTime ? "Pass" : "Fail";
+    }
 
-  const manualQualification = qualificationLevel || "";
+    const manualQualification = qualificationLevel || "";
 
-  const pendingSession = findItemById(
-    sessionsRef.current,
-    selectedSessionRef.current,
-    "SessionID"
-  );
-
-  const timerStageScoringSessionType =
-    getStageScoringSessionType(pendingSession, selectedSessionRef.current);
-  const usesTimerStageScoring = Boolean(timerStageScoringSessionType);
-
-  const timerUspsaPoints = usesTimerStageScoring ? uspsaScore.points : "";
-  const timerUspsaHitFactor = usesTimerStageScoring ? uspsaScore.hitFactor : "";
-  let timerVideoMeta = videoCaptureSessionRef.current.recordedMeta;
-
-  if (!usesTimerStageScoring && timerVideoMeta?.localFilePath) {
-    setVideoStatus(
-      isFirebaseConfigured()
-        ? "Uploading timer video to cloud storage..."
-        : "Timer video saved locally only. Firebase is not configured."
+    const pendingSession = findItemById(
+      sessionsRef.current,
+      selectedSessionRef.current,
+      "SessionID"
     );
 
-    try {
-      const uploadFile = await buildUploadFile({
-        filePath: timerVideoMeta.localFilePath,
-        fileName: timerVideoMeta.name || "",
-      });
-      const uploadResult = await uploadVideoAttachment(uploadFile, {
-        shooterId: selectedShooterRef.current,
-        drillId: selectedDrillRef.current,
-        sessionId: selectedSessionRef.current,
-        source: "timer",
-      });
+    const timerStageScoringSessionType =
+      getStageScoringSessionType(pendingSession, selectedSessionRef.current);
+    const usesTimerStageScoring = Boolean(timerStageScoringSessionType);
+    const liveUspsaScore = usesTimerStageScoring ? calculateUspsaScore() : null;
 
-      timerVideoMeta = {
-        ...timerVideoMeta,
-        url: uploadResult.url,
-        rawUrl: uploadResult.rawUrl || timerVideoMeta.rawUrl || "",
-        storage: uploadResult.uploaded ? "cloud" : timerVideoMeta.storage || "local-only",
-        uploadedAt: uploadResult.uploaded ? new Date().toISOString() : timerVideoMeta.uploadedAt || "",
-        status: uploadResult.uploaded ? "Uploaded" : timerVideoMeta.status || "Local only",
-      };
+    const timerUspsaPoints = usesTimerStageScoring ? liveUspsaScore?.points ?? "" : "";
+    const timerUspsaHitFactor =
+      usesTimerStageScoring ? liveUspsaScore?.hitFactor ?? "" : "";
+    let timerVideoMeta = videoCaptureSessionRef.current.recordedMeta;
 
-      videoCaptureSessionRef.current = {
-        ...videoCaptureSessionRef.current,
-        recordedMeta: timerVideoMeta,
-      };
-      console.log("Timer video upload result:", timerVideoMeta);
+    if (!usesTimerStageScoring && timerVideoMeta?.localFilePath) {
       setVideoStatus(
-        uploadResult.uploaded
-          ? "Timer video uploaded. Saving run..."
-          : "Timer video stayed local only. Saving run..."
+        isFirebaseConfigured()
+          ? "Uploading timer video to cloud storage..."
+          : "Timer video saved locally only. Firebase is not configured."
       );
-    } catch (error) {
-      console.error("Timer video upload error:", error);
-      console.error("Timer video upload error details:", {
-        code: error?.code,
-        message: error?.message,
-        name: error?.name,
-        full: error,
-      });
-      setVideoStatus(`Timer video upload failed: ${describeError(error)}`);
-    }
-  }
 
-  const run = {
-    timestamp: new Date().toISOString(),
-    sessionId: selectedSessionRef.current,
-    shooterId: selectedShooterRef.current,
-    drillId: selectedDrillRef.current,
-    totalTime: Number(totalTime.toFixed(3)),
-    shotCount: shotTimes.length,
-    firstShot: Number(firstShot.toFixed(3)),
-    avgSplit,
-    bestSplit,
-    worstSplit,
-    splitsRaw,
-    source: "timer",
-    score: usesTimerStageScoring ? timerUspsaPoints : scoreValue,
-    passFail: computedPassFail,
-    notes: "",
-    qualificationLevel: manualQualification,
-    videoUrl: timerVideoMeta?.url || "",
-    videoRawUrl: timerVideoMeta?.rawUrl || "",
-    videoFileName: timerVideoMeta?.name || "",
-    scoringType: timerStageScoringSessionType,
-    powerFactor: usesTimerStageScoring ? powerFactor : "",
-    aHits: usesTimerStageScoring ? Number(aHits || 0) : "",
-    cHits: usesTimerStageScoring ? Number(cHits || 0) : "",
-    dHits: usesTimerStageScoring ? Number(dHits || 0) : "",
-    misses: usesTimerStageScoring ? Number(misses || 0) : "",
-    noShoots: usesTimerStageScoring ? Number(noShoots || 0) : "",
-    steelHits: usesTimerStageScoring ? Number(steelHits || 0) : "",
-    steelMisses: usesTimerStageScoring ? Number(steelMisses || 0) : "",
-    totalPoints: timerUspsaPoints,
-    hitFactor: timerUspsaHitFactor,
-    stageName: stageName || "Course",
-    totalRounds: calculateShooterTotalRounds(
-      runsRef.current,
-      selectedShooterRef.current,
-      shotTimes.length
-    ),
-  };
+      try {
+        const uploadFile = await buildUploadFile({
+          filePath: timerVideoMeta.localFilePath,
+          fileName: timerVideoMeta.name || "",
+        });
+        const uploadResult = await uploadVideoAttachment(uploadFile, {
+          shooterId: selectedShooterRef.current,
+          drillId: selectedDrillRef.current,
+          sessionId: selectedSessionRef.current,
+          source: "timer",
+        });
 
-  console.log("FINALIZE selectedSessionRef.current:", selectedSessionRef.current);
-  console.log("FINALIZE pendingSession:", pendingSession);
-  console.log("FINALIZE session name:", pendingSession?.SessionName);
-  console.log("FINALIZE timerStageScoringSessionType:", timerStageScoringSessionType);
+        timerVideoMeta = {
+          ...timerVideoMeta,
+          url: uploadResult.url,
+          rawUrl: uploadResult.rawUrl || timerVideoMeta.rawUrl || "",
+          storage: uploadResult.uploaded ? "cloud" : timerVideoMeta.storage || "local-only",
+          uploadedAt: uploadResult.uploaded ? new Date().toISOString() : timerVideoMeta.uploadedAt || "",
+          status: uploadResult.uploaded ? "Uploaded" : timerVideoMeta.status || "Local only",
+        };
 
-  if (usesTimerStageScoring) {
-    console.log("OPENING USPSA POPUP", run);
-    setPendingUspsaRun(run);
-    setShowUspsaScoringModal(true);
-    currentShots = [];
-    setLiveShotTimes([]);
-    return;
-  }
-
-  console.log("AUTO RUN:", run);
-
-  let result = null;
-
-  if (!isSavingRef.current) {
-    isSavingRef.current = true;
-
-    try {
-      result = await apiSaveRun(run);
-    } catch (e) {
-      console.error("Save error:", e);
-      setMessage(`Timer run save error: ${e.message || e}`);
+        videoCaptureSessionRef.current = {
+          ...videoCaptureSessionRef.current,
+          recordedMeta: timerVideoMeta,
+        };
+        console.log("Timer video upload result:", timerVideoMeta);
+        setVideoStatus(
+          uploadResult.uploaded
+            ? "Timer video uploaded. Saving run..."
+            : "Timer video stayed local only. Saving run..."
+        );
+      } catch (error) {
+        console.error("Timer video upload error:", error);
+        console.error("Timer video upload error details:", {
+          code: error?.code,
+          message: error?.message,
+          name: error?.name,
+          full: error,
+        });
+        setVideoStatus(`Timer video upload failed: ${describeError(error)}`);
+      }
     }
 
-    isSavingRef.current = false;
-  }
-
-  console.log("AUTO SAVE RESPONSE:", result);
-
-  if (result && result.success === true) {
-    setMessage("Timer run saved.");
-    setLastTimerRun(run);
-    setLiveShotTimes([]);
-    lastShotSnapshotRef.current = [];
-    discardCurrentTimerRunRef.current = false;
-    videoCaptureSessionRef.current = {
-      active: false,
-      awaitingStop: false,
-      pendingFinalize: false,
-      discardPending: false,
-      recordedMeta: null,
+    const run = {
+      timestamp: new Date().toISOString(),
+      sessionId: selectedSessionRef.current,
+      shooterId: selectedShooterRef.current,
+      drillId: selectedDrillRef.current,
+      totalTime: Number(totalTime.toFixed(3)),
+      shotCount: shotTimes.length,
+      firstShot: Number(firstShot.toFixed(3)),
+      avgSplit,
+      bestSplit,
+      worstSplit,
+      splitsRaw,
+      source: "timer",
+      score: usesTimerStageScoring ? timerUspsaPoints : scoreValue,
+      passFail: computedPassFail,
+      notes: "",
+      qualificationLevel: manualQualification,
+      videoUrl: timerVideoMeta?.url || "",
+      videoRawUrl: timerVideoMeta?.rawUrl || "",
+      videoFileName: timerVideoMeta?.name || "",
+      scoringType: timerStageScoringSessionType,
+      powerFactor: usesTimerStageScoring ? powerFactor : "",
+      aHits: usesTimerStageScoring ? Number(aHits || 0) : "",
+      cHits: usesTimerStageScoring ? Number(cHits || 0) : "",
+      dHits: usesTimerStageScoring ? Number(dHits || 0) : "",
+      misses: usesTimerStageScoring ? Number(misses || 0) : "",
+      noShoots: usesTimerStageScoring ? Number(noShoots || 0) : "",
+      steelHits: usesTimerStageScoring ? Number(steelHits || 0) : "",
+      steelMisses: usesTimerStageScoring ? Number(steelMisses || 0) : "",
+      totalPoints: timerUspsaPoints,
+      hitFactor: timerUspsaHitFactor,
+      stageName: stageName || "Course",
+      totalRounds: calculateShooterTotalRounds(
+        runsRef.current,
+        selectedShooterRef.current,
+        shotTimes.length
+      ),
     };
-    handleMatchRunSaved(run);
-    await load();
-  } else {
-    const errorText =
-      result?.error ||
-      result?.raw ||
-      "Timer run did not save. Check Xcode logs for AUTO RUN and AUTO SAVE RESPONSE.";
-    setMessage(errorText);
-    console.error("Timer run save failed with result:", result);
-  }
 
-  currentShots = [];
-  lastShotSnapshotRef.current = [];
+    console.log("FINALIZE selectedSessionRef.current:", selectedSessionRef.current);
+    console.log("FINALIZE pendingSession:", pendingSession);
+    console.log("FINALIZE session name:", pendingSession?.SessionName);
+    console.log("FINALIZE timerStageScoringSessionType:", timerStageScoringSessionType);
+
+    if (usesTimerStageScoring) {
+      console.log("OPENING USPSA POPUP", run);
+      setPendingUspsaRun(run);
+      setShowUspsaScoringModal(true);
+      currentShotsRef.current = [];
+      setLiveShotTimes([]);
+      return;
+    }
+
+    console.log("AUTO RUN:", run);
+
+    let result = null;
+
+    if (!isSavingRef.current) {
+      isSavingRef.current = true;
+
+      try {
+        result = await apiSaveRun(run);
+      } catch (e) {
+        console.error("Save error:", e);
+        setMessage(`Timer run save error: ${e.message || e}`);
+      }
+
+      isSavingRef.current = false;
+    }
+
+    console.log("AUTO SAVE RESPONSE:", result);
+
+    if (result && result.success === true) {
+      setMessage("Timer run saved.");
+      setLastTimerRun(run);
+      setLiveShotTimes([]);
+      lastShotSnapshotRef.current = [];
+      discardCurrentTimerRunRef.current = false;
+      videoCaptureSessionRef.current = {
+        active: false,
+        awaitingStop: false,
+        pendingFinalize: false,
+        discardPending: false,
+        recordedMeta: null,
+      };
+      handleMatchRunSaved(run);
+      await load();
+    } else {
+      const errorText =
+        result?.error ||
+        result?.raw ||
+        "Timer run did not save. Check Xcode logs for AUTO RUN and AUTO SAVE RESPONSE.";
+      setMessage(errorText);
+      console.error("Timer run save failed with result:", result);
+    }
+
+    currentShotsRef.current = [];
+    lastShotSnapshotRef.current = [];
+  } catch (error) {
+    console.error("finalizeRun error:", {
+      message: error?.message || "",
+      stack: error?.stack || "",
+      selectedShooter: selectedShooterRef.current,
+      selectedDrill: selectedDrillRef.current,
+      selectedSession: selectedSessionRef.current,
+    });
+    setMessage(`Timer finalize error: ${error?.message || error}`);
+  }
 }
 
 async function completeUspsaScoringAndLog() {
@@ -7194,7 +7442,7 @@ async function completeUspsaScoringAndLog() {
       setLastTimerRun(finalRunToSave);
       setLiveShotTimes([]);
       lastShotSnapshotRef.current = [];
-      currentShots = [];
+      currentShotsRef.current = [];
       discardCurrentTimerRunRef.current = false;
       videoCaptureSessionRef.current = {
         active: false,
@@ -9221,8 +9469,24 @@ async function autoReconnectTimer() {
 	                    {result ? `Saved ${result.totalTime || "—"}s • ${result.passFail || "Scored"}` : isCurrent ? "Current shooter" : "Waiting"}
 	                  </div>
 	                </div>
-	                <div style={{ color: result ? theme.successText : isCurrent ? theme.accent : theme.subtext, fontWeight: 800 }}>
+	                <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+                    <div style={{ color: result ? theme.successText : isCurrent ? theme.accent : theme.subtext, fontWeight: 800 }}>
 	                  {result ? "Done" : isCurrent ? "Up" : "Queued"}
+                    </div>
+                    {!isCurrent ? (
+                      <button
+                        type="button"
+                        style={{
+                          ...secondaryButtonStyle,
+                          padding: "8px 12px",
+                          fontSize: 13,
+                          whiteSpace: "nowrap",
+                        }}
+                        onClick={() => setCurrentMatchShooter(shooterId)}
+                      >
+                        Set Current
+                      </button>
+                    ) : null}
 	                </div>
 	              </div>
 	            );
@@ -10692,8 +10956,10 @@ onTouchEnd={(e) => {
   style={inputStyle}
   value={selectedDrill}
   onChange={(e) => {
-    setSelectedDrill(e.target.value);
-    selectedDrillRef.current = e.target.value;
+    const nextValue = e.target.value;
+    setSelectedDrill(nextValue);
+    selectedDrillRef.current = nextValue;
+    updateActiveMatchSelectionField("drillId", nextValue);
   }}
 >
   {drills.map((d) => (
@@ -10707,8 +10973,10 @@ onTouchEnd={(e) => {
   style={inputStyle}
   value={selectedSession}
   onChange={(e) => {
-    setSelectedSession(e.target.value);
-    selectedSessionRef.current = e.target.value;
+    const nextValue = e.target.value;
+    setSelectedSession(nextValue);
+    selectedSessionRef.current = nextValue;
+    updateActiveMatchSelectionField("sessionId", nextValue);
   }}
 >
   {sessions.map((s) => (
@@ -11362,8 +11630,24 @@ onTouchEnd={(e) => {
                             {result ? `Saved ${result.totalTime || "—"}s • ${result.passFail || "Scored"}` : isCurrent ? "Current shooter" : "Waiting"}
                           </div>
                         </div>
-                        <div style={{ color: result ? theme.successText : isCurrent ? theme.accent : theme.subtext, fontWeight: 800 }}>
-                          {result ? "Done" : isCurrent ? "Up" : "Queued"}
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+                          <div style={{ color: result ? theme.successText : isCurrent ? theme.accent : theme.subtext, fontWeight: 800 }}>
+                            {result ? "Done" : isCurrent ? "Up" : "Queued"}
+                          </div>
+                          {!isCurrent ? (
+                            <button
+                              type="button"
+                              style={{
+                                ...secondaryButtonStyle,
+                                padding: "8px 12px",
+                                fontSize: 13,
+                                whiteSpace: "nowrap",
+                              }}
+                              onClick={() => setCurrentMatchShooter(shooterId)}
+                            >
+                              Set Current
+                            </button>
+                          ) : null}
                         </div>
                       </div>
                     );
@@ -11916,11 +12200,15 @@ onTouchEnd={(e) => {
               selectedShooterRef.current = String(item.ShooterID);
               setShooterSearch("");
             } else if (selectorOpen === "drill") {
-              setSelectedDrill(String(item.DrillID));
-              selectedDrillRef.current = String(item.DrillID);
+              const nextDrillId = String(item.DrillID);
+              setSelectedDrill(nextDrillId);
+              selectedDrillRef.current = nextDrillId;
+              updateActiveMatchSelectionField("drillId", nextDrillId);
             } else {
-              setSelectedSession(String(item.SessionID));
-              selectedSessionRef.current = String(item.SessionID);
+              const nextSessionId = String(item.SessionID);
+              setSelectedSession(nextSessionId);
+              selectedSessionRef.current = nextSessionId;
+              updateActiveMatchSelectionField("sessionId", nextSessionId);
 
               const sessionName = String(item.SessionName || "").trim().toUpperCase();
 
@@ -11930,8 +12218,10 @@ onTouchEnd={(e) => {
                 );
 
                 if (courseDrill) {
-                  setSelectedDrill(String(courseDrill.DrillID));
-                  selectedDrillRef.current = String(courseDrill.DrillID);
+                  const courseDrillId = String(courseDrill.DrillID);
+                  setSelectedDrill(courseDrillId);
+                  selectedDrillRef.current = courseDrillId;
+                  updateActiveMatchSelectionField("drillId", courseDrillId);
                 }
               }
             }
