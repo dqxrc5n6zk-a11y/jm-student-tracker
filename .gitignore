@@ -11,6 +11,7 @@ node_modules
 dist
 dist-ssr
 .env
+ios/App/App/public
 *.local
 
 # Editor directories and files
