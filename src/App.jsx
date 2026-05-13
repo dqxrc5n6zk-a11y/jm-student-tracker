@@ -5,6 +5,7 @@ import { BleClient } from "@capacitor-community/bluetooth-le";
 import { createPortal } from "react-dom";
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import headerImg from "./assets/jmt-header.png";
+import jmTrainingLogo from "./assets/jm-training-logo.jpeg";
 import {
   Timer,
   PenLine,
@@ -23,6 +24,7 @@ import {
   ChevronUp,
   ChevronDown,
   Trash2,
+  CreditCard,
 } from "lucide-react";
 import { collection, getDocs, orderBy, query } from "firebase/firestore";
 import PullToRefresh from "react-simple-pull-to-refresh";
@@ -54,6 +56,89 @@ const MATCH_STORAGE_KEY = "jmt-active-match-v1";
 const MATCH_HISTORY_STORAGE_KEY = "jmt-match-history-v1";
 const QUALIFICATION_STORAGE_KEY = "jmt-active-qualification-v1";
 const AUTH_PENDING_ROLE_KEY = "jmt-auth-pending-role";
+const MEMBERSHIP_API_STORAGE_KEY = "jmt-membership-api-url-v1";
+
+const MEMBERSHIP_TIER_ALIASES = {
+  foundation: "starter",
+  training: "pro",
+  elite: "university",
+};
+
+const MEMBERSHIP_TIER_LABELS = {
+  starter: "Starter",
+  pro: "Pro",
+  university: "University",
+};
+
+function normalizeMembershipTier(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return MEMBERSHIP_TIER_ALIASES[normalized] || normalized;
+}
+
+function formatMembershipTier(value) {
+  const normalized = normalizeMembershipTier(value);
+  return MEMBERSHIP_TIER_LABELS[normalized] || String(value || "").trim() || "-";
+}
+
+function buildMembershipQrUrl(cardId) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=12&data=${encodeURIComponent(String(cardId || "").trim())}`;
+}
+
+function requestMembershipJsonp(endpoint, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (typeof document === "undefined") {
+      reject(new Error("Membership sync requires a browser."));
+      return;
+    }
+
+    const callbackName = `jmtAccountMembership_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const script = document.createElement("script");
+    const url = new URL(endpoint);
+
+    Object.entries(params).forEach(([key, value]) => {
+      url.searchParams.set(key, value);
+    });
+    url.searchParams.set("callback", callbackName);
+
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("Membership card sync timed out."));
+    }, 12000);
+
+    function cleanup() {
+      window.clearTimeout(timeoutId);
+      script.remove();
+      delete window[callbackName];
+    }
+
+    window[callbackName] = (data) => {
+      cleanup();
+      resolve(data);
+    };
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("Membership card sync failed."));
+    };
+
+    script.src = url.toString();
+    document.body.appendChild(script);
+  });
+}
+
+function normalizeMembershipMember(rawMember = {}) {
+  const membership = normalizeMembershipTier(rawMember.membership || rawMember.Membership);
+  return {
+    memberId: String(rawMember.memberId || rawMember.MemberID || "").trim(),
+    cardId: String(rawMember.cardId || rawMember.CardID || "").trim().toUpperCase(),
+    name: String(rawMember.name || rawMember.Name || "").trim(),
+    email: String(rawMember.email || rawMember.Email || "").trim(),
+    phone: String(rawMember.phone || rawMember.Phone || "").trim(),
+    membership,
+    status: String(rawMember.status || rawMember.Status || "Active").trim() || "Active",
+    joinDate: String(rawMember.joinDate || rawMember.JoinDate || "").trim(),
+  };
+}
 
 function normalizeCloudCourse(docId, data = {}) {
   const createdAtValue = data.createdAt;
@@ -823,6 +908,7 @@ function parseQualificationConfig(drill) {
       return {
         type: String(parsed.type || "marksmanship").trim().toLowerCase() || "marksmanship",
         passScore: Number(parsed.passScore || 0) || 0,
+        passTime: Number(parsed.passTime || parsed.maxTime || 0) || 0,
         distances,
       };
     } catch (error) {
@@ -831,7 +917,11 @@ function parseQualificationConfig(drill) {
     }
   })();
 
-  if (parsedFromJson?.distances?.length) {
+  if (
+    parsedFromJson &&
+    (isSingleStageQualificationConfig(parsedFromJson) ||
+      parsedFromJson?.distances?.length)
+  ) {
     return parsedFromJson;
   }
 
@@ -863,6 +953,7 @@ function parseQualificationConfig(drill) {
   return {
     type: "marksmanship",
     passScore: Number(drill?.PassScore || drill?.MinScore || 0) || 0,
+    passTime: Number(drill?.PassTime || 0) || 0,
     distances: fallbackDistances.length
       ? fallbackDistances
       : [
@@ -873,6 +964,17 @@ function parseQualificationConfig(drill) {
           { label: "Distance 5", roundCount: 0, maxScore: 0 },
         ],
   };
+}
+
+function isSingleStageQualificationConfig(config) {
+  const normalizedType = String(config?.type || "").trim().toLowerCase();
+  return (
+    normalizedType === "single-stage" ||
+    normalizedType === "single_stage" ||
+    normalizedType === "single stage" ||
+    normalizedType === "roster" ||
+    normalizedType === "single"
+  );
 }
 
 function getQualificationStageTarget(distance) {
@@ -1514,6 +1616,10 @@ export default function App() {
   const [studentFilterDrill, setStudentFilterDrill] = useState("all");
   const [studentFilterSession, setStudentFilterSession] = useState("all");
   const [studentFilterDate, setStudentFilterDate] = useState("all");
+  const [accountMembershipCard, setAccountMembershipCard] = useState(null);
+  const [accountMembershipLoading, setAccountMembershipLoading] = useState(false);
+  const [accountMembershipMessage, setAccountMembershipMessage] = useState("");
+  const [accountMembershipQrOpen, setAccountMembershipQrOpen] = useState(false);
 
   const [timerConnected, setTimerConnected] = useState(false);
 const [timerDeviceName, setTimerDeviceName] = useState("");
@@ -2085,6 +2191,16 @@ const hasRememberedNativeTimer = useMemo(() => {
   }
 }, [timerStatusMessage, timerConnected]);
 
+const membershipApiUrl = useMemo(() => {
+  const envUrl = String(import.meta.env.VITE_MEMBERSHIP_API_BASE || "").trim();
+
+  try {
+    return String(localStorage.getItem(MEMBERSHIP_API_STORAGE_KEY) || envUrl || "").trim();
+  } catch {
+    return envUrl;
+  }
+}, []);
+
 const shouldShowForgetTimerButton =
   hasRememberedNativeTimer ||
   /pair|peer removed pairing|failed to connect|connection timeout|saved timer unavailable/i.test(
@@ -2117,6 +2233,7 @@ const [matchRosterIds, setMatchRosterIds] = useState([]);
 const [activeQualification, setActiveQualification] = useState(() =>
   readStoredJson(QUALIFICATION_STORAGE_KEY, null)
 );
+const activeQualificationRef = useRef(readStoredJson(QUALIFICATION_STORAGE_KEY, null));
 const [qualificationShooterSearch, setQualificationShooterSearch] = useState("");
 const [qualificationRosterIds, setQualificationRosterIds] = useState([]);
 const [qualificationStageEntries, setQualificationStageEntries] = useState({});
@@ -2263,7 +2380,24 @@ useEffect(() => {
   selectedDrillRef.current = String(activeQualification.drillId || "");
   setSelectedSession(String(activeQualification.sessionId || ""));
   selectedSessionRef.current = String(activeQualification.sessionId || "");
-}, [activeQualification?.distanceIndex, activeQualification?.drillId, activeQualification?.sessionId]);
+
+  if (activeQualification.mode === "single-stage") {
+    const currentQualificationIndex = Number(activeQualification.currentIndex || 0);
+    const currentQualificationShooterId = String(
+      activeQualification.shooterIds?.[currentQualificationIndex] || ""
+    ).trim();
+
+    if (currentQualificationShooterId) {
+      setSelectedShooter(currentQualificationShooterId);
+      selectedShooterRef.current = currentQualificationShooterId;
+    }
+  }
+}, [
+  activeQualification?.currentIndex,
+  activeQualification?.distanceIndex,
+  activeQualification?.drillId,
+  activeQualification?.sessionId,
+]);
 
 useEffect(() => {
   if (activeMatch) return;
@@ -2355,6 +2489,7 @@ const selectedQualificationConfig = useMemo(
   () => parseQualificationConfig(selectedDrillData),
   [selectedDrillData]
 );
+const selectedQualificationIsSingleStage = isSingleStageQualificationConfig(selectedQualificationConfig);
 const qualificationModeActive = Boolean(selectedQualificationConfig || activeQualification);
 const qualificationDistances = selectedQualificationConfig?.distances || [];
 const activeQualificationDistanceIndex = Number(activeQualification?.distanceIndex || 0);
@@ -2368,6 +2503,7 @@ const selectedQualificationPreviewTarget = getQualificationStageTarget(
 );
 const activeQualificationPassPercent = getQualificationStagePassPercent(activeQualificationDistance);
 const activeQualificationStageTarget = getQualificationStageTarget(activeQualificationDistance);
+const activeQualificationIsSingleStage = isSingleStageQualificationConfig(activeQualification);
 const filteredQualificationShooterOptions = useMemo(() => {
   const searchValue = qualificationShooterSearch.trim().toLowerCase();
 
@@ -2395,6 +2531,40 @@ const activeQualificationRoster = useMemo(
       .filter(Boolean),
   [activeQualification?.shooterIds, shooters]
 );
+const activeQualificationCurrentShooter = useMemo(() => {
+  if (!activeQualificationIsSingleStage || !activeQualification) return null;
+  return (
+    findItemById(
+      shooters,
+      activeQualification.shooterIds?.[Number(activeQualification.currentIndex || 0)],
+      "ShooterID"
+    ) || null
+  );
+}, [activeQualification, activeQualificationIsSingleStage, shooters]);
+const activeQualificationNextShooter = useMemo(() => {
+  if (!activeQualificationIsSingleStage || !activeQualification) return null;
+
+  const shooterIds = Array.isArray(activeQualification.shooterIds)
+    ? activeQualification.shooterIds
+    : [];
+  if (!shooterIds.length) return null;
+
+  const completedShooterIds = new Set(
+    (activeQualification.results || [])
+      .map((entry) => String(entry?.shooterId || "").trim())
+      .filter(Boolean)
+  );
+  const startIndex = Number(activeQualification.currentIndex || 0);
+
+  for (let offset = 1; offset < shooterIds.length; offset += 1) {
+    const candidateIndex = (startIndex + offset) % shooterIds.length;
+    const candidateShooterId = String(shooterIds[candidateIndex] || "").trim();
+    if (!candidateShooterId || completedShooterIds.has(candidateShooterId)) continue;
+    return findItemById(shooters, candidateShooterId, "ShooterID") || null;
+  }
+
+  return null;
+}, [activeQualification, activeQualificationIsSingleStage, shooters]);
 const qualificationOverallResults = useMemo(() => {
   const totals = new Map();
 
@@ -2479,6 +2649,10 @@ useEffect(() => {
 useEffect(() => {
   activeMatchRef.current = activeMatch;
 }, [activeMatch]);
+
+useEffect(() => {
+  activeQualificationRef.current = activeQualification;
+}, [activeQualification]);
 
 useEffect(() => {
   try {
@@ -3900,6 +4074,8 @@ function clearRunForm() {
       return;
     }
 
+    const singleStageQualification = isSingleStageQualificationConfig(selectedQualificationConfig);
+
     const nextQualification = {
       id: `qualification-${Date.now()}`,
       name:
@@ -3908,9 +4084,12 @@ function clearRunForm() {
       drillId: String(selectedDrill),
       sessionId: String(selectedSession),
       shooterIds: [...qualificationRosterIds],
+      currentIndex: 0,
       distanceIndex: 0,
       distances: qualificationDistances,
       passScore: Number(selectedQualificationConfig.passScore || 0) || 0,
+      passTime: Number(selectedQualificationConfig.passTime || 0) || 0,
+      mode: singleStageQualification ? "single-stage" : "marksmanship",
       createdAt: new Date().toISOString(),
       results: [],
       status: "active",
@@ -3919,8 +4098,17 @@ function clearRunForm() {
     setActiveQualification(nextQualification);
     setQualificationShooterSearch("");
     setQualificationStageEntries({});
+
+    const firstQualificationShooterId = String(nextQualification.shooterIds?.[0] || "").trim();
+    if (firstQualificationShooterId) {
+      setSelectedShooter(firstQualificationShooterId);
+      selectedShooterRef.current = firstQualificationShooterId;
+    }
+
     setMessage(
-      `${nextQualification.name} started. Score ${nextQualification.distances?.[0]?.label || "Distance 1"} for all shooters.`
+      singleStageQualification
+        ? `${nextQualification.name} started. ${findItemById(shooters, firstQualificationShooterId, "ShooterID")?.Name || "First shooter"} is up.`
+        : `${nextQualification.name} started. Score ${nextQualification.distances?.[0]?.label || "Distance 1"} for all shooters.`
     );
     window.requestAnimationFrame(() => {
       setActiveTab("timer");
@@ -4161,6 +4349,38 @@ function clearRunForm() {
     return -1;
   }
 
+  function getNextPendingQualificationIndex(
+    qualification,
+    startIndex,
+    results,
+    { includeCurrent = false } = {}
+  ) {
+    const shooterIds = Array.isArray(qualification?.shooterIds) ? qualification.shooterIds : [];
+    if (shooterIds.length === 0) return -1;
+
+    const completedShooterIds = new Set(
+      (Array.isArray(results) ? results : [])
+        .map((entry) => String(entry?.shooterId || "").trim())
+        .filter(Boolean)
+    );
+
+    const normalizedStartIndex =
+      Number.isFinite(Number(startIndex)) && Number(startIndex) >= 0
+        ? Number(startIndex)
+        : 0;
+
+    for (let offset = includeCurrent ? 0 : 1; offset < shooterIds.length; offset += 1) {
+      const candidateIndex = (normalizedStartIndex + offset) % shooterIds.length;
+      const candidateShooterId = String(shooterIds[candidateIndex] || "").trim();
+      if (!candidateShooterId) continue;
+      if (!completedShooterIds.has(candidateShooterId)) {
+        return candidateIndex;
+      }
+    }
+
+    return -1;
+  }
+
   function handleMatchRunSaved(savedRun) {
     const currentMatchState = activeMatchRef.current;
     if (!currentMatchState) return;
@@ -4208,6 +4428,145 @@ function clearRunForm() {
         nextShooterId,
         "ShooterID"
       )?.Name || "next shooter"}.`
+    );
+  }
+
+  function handleQualificationRunSaved(savedRun) {
+    const currentQualificationState = activeQualificationRef.current;
+    if (!currentQualificationState || currentQualificationState.mode !== "single-stage") return;
+
+    const currentIndex = Number(currentQualificationState.currentIndex || 0);
+    const currentShooterId = String(currentQualificationState.shooterIds?.[currentIndex] || "");
+    const nextResults = [
+      ...(currentQualificationState.results || []).filter(
+        (entry) => String(entry.shooterId) !== currentShooterId
+      ),
+      {
+        shooterId: currentShooterId,
+        savedAt: new Date().toISOString(),
+        totalTime: savedRun?.totalTime ?? savedRun?.TotalTime ?? "",
+        score: savedRun?.score ?? savedRun?.Score ?? "",
+        passFail: savedRun?.passFail ?? savedRun?.PassFail ?? "",
+      },
+    ];
+
+    const nextIndex = getNextPendingQualificationIndex(
+      currentQualificationState,
+      currentIndex,
+      nextResults
+    );
+    const nextShooterId =
+      nextIndex >= 0 ? String(currentQualificationState.shooterIds?.[nextIndex] || "") : "";
+
+    if (nextIndex === -1 || !nextShooterId) {
+      finishQualification({ silent: true });
+      setMessage(`Qualification complete. ${currentQualificationState.name} is finished.`);
+      clearRunForm();
+      return;
+    }
+
+    const nextQualification = {
+      ...currentQualificationState,
+      currentIndex: nextIndex,
+      results: nextResults,
+      updatedAt: new Date().toISOString(),
+    };
+
+    activeQualificationRef.current = nextQualification;
+    setActiveQualification(nextQualification);
+    setSelectedShooter(nextShooterId);
+    selectedShooterRef.current = nextShooterId;
+    clearRunForm();
+    setMessage(
+      `Saved ${findItemById(shooters, currentShooterId, "ShooterID")?.Name || "shooter"}. Next up: ${
+        findItemById(shooters, nextShooterId, "ShooterID")?.Name || "next shooter"
+      }.`
+    );
+  }
+
+  function setCurrentQualificationShooter(shooterId) {
+    const currentQualificationState = activeQualificationRef.current;
+    if (!currentQualificationState || currentQualificationState.mode !== "single-stage") return;
+
+    const normalizedShooterId = String(shooterId || "").trim();
+    if (!normalizedShooterId) return;
+
+    const nextIndex = currentQualificationState.shooterIds.findIndex(
+      (item) => String(item) === normalizedShooterId
+    );
+    if (nextIndex === -1) return;
+
+    const nextResults = (currentQualificationState.results || []).filter((entry) => {
+      const resultShooterId = String(entry?.shooterId || "");
+      const resultIndex = currentQualificationState.shooterIds.findIndex(
+        (item) => String(item) === resultShooterId
+      );
+      return resultIndex !== -1 && resultIndex < nextIndex;
+    });
+
+    const nextQualification = {
+      ...currentQualificationState,
+      currentIndex: nextIndex,
+      results: nextResults,
+      updatedAt: new Date().toISOString(),
+    };
+
+    activeQualificationRef.current = nextQualification;
+    setActiveQualification(nextQualification);
+    setSelectedShooter(normalizedShooterId);
+    selectedShooterRef.current = normalizedShooterId;
+    clearRunForm();
+    setMessage(
+      `${findItemById(shooters, normalizedShooterId, "ShooterID")?.Name || "Selected shooter"} is now up. Qualification will continue from there.`
+    );
+  }
+
+  function skipCurrentQualificationShooter() {
+    const currentQualificationState = activeQualificationRef.current;
+    if (!currentQualificationState || currentQualificationState.mode !== "single-stage") return;
+
+    const currentIndex = Number(currentQualificationState.currentIndex || 0);
+    const nextIndex = getNextPendingQualificationIndex(
+      currentQualificationState,
+      currentIndex,
+      currentQualificationState.results || []
+    );
+    const nextShooterId =
+      nextIndex >= 0 ? String(currentQualificationState.shooterIds?.[nextIndex] || "") : "";
+
+    if (nextIndex === -1 || !nextShooterId) {
+      const currentShooterId = String(currentQualificationState.shooterIds?.[currentIndex] || "");
+      const currentAlreadySaved = (currentQualificationState.results || []).some(
+        (entry) => String(entry?.shooterId || "") === currentShooterId
+      );
+
+      if (!currentAlreadySaved && currentShooterId) {
+        setMessage(
+          `${activeQualificationCurrentShooter?.Name || "Current shooter"} is the only shooter left without a saved qualification run.`
+        );
+        return;
+      }
+
+      finishQualification({ silent: true });
+      setMessage(`Qualification complete. ${currentQualificationState.name} is finished.`);
+      return;
+    }
+
+    const nextQualification = {
+      ...currentQualificationState,
+      currentIndex: nextIndex,
+      updatedAt: new Date().toISOString(),
+    };
+
+    activeQualificationRef.current = nextQualification;
+    setActiveQualification(nextQualification);
+    setSelectedShooter(nextShooterId);
+    selectedShooterRef.current = nextShooterId;
+    clearRunForm();
+    setMessage(
+      `Skipped ${activeQualificationCurrentShooter?.Name || "current shooter"}. Next up: ${
+        findItemById(shooters, nextShooterId, "ShooterID")?.Name || "next shooter"
+      }.`
     );
   }
 
@@ -4453,7 +4812,11 @@ if (result && result.success === true) {
             ? "Qualification entry saved to Google Sheets."
             : "Run saved to Google Sheets."
         );
-        handleMatchRunSaved(run);
+        if (activeQualificationRef.current?.mode === "single-stage") {
+          handleQualificationRunSaved(run);
+        } else {
+          handleMatchRunSaved(run);
+        }
         clearRunForm();
         await load();
       } else {
@@ -5747,6 +6110,53 @@ const uspsaStageRankings = uspsaStageLeaderboardRaw
     };
   }, [drills, filteredStudentRuns]);
   const studentLastRun = studentRuns[0] || null;
+  const accountMembershipEmail = String(
+    authProfile?.email || authUser?.email || ""
+  ).trim().toLowerCase();
+  const loadAccountMembershipCard = useCallback(async () => {
+    if (!authUser || !accountMembershipEmail) {
+      setAccountMembershipCard(null);
+      setAccountMembershipMessage("");
+      return;
+    }
+
+    if (!membershipApiUrl) {
+      setAccountMembershipCard(null);
+      setAccountMembershipMessage("Membership card sync is not connected on this device yet.");
+      return;
+    }
+
+    setAccountMembershipLoading(true);
+    setAccountMembershipMessage("Syncing membership card...");
+
+    try {
+      const response = await requestMembershipJsonp(membershipApiUrl, {
+        action: "membershipSnapshot",
+      });
+      if (response?.ok === false) {
+        throw new Error(response.error || "Membership card sync failed.");
+      }
+
+      const matchedMember = (Array.isArray(response?.members) ? response.members : [])
+        .map(normalizeMembershipMember)
+        .find((member) => String(member.email || "").trim().toLowerCase() === accountMembershipEmail);
+
+      if (!matchedMember) {
+        setAccountMembershipCard(null);
+        setAccountMembershipMessage("No JM Training member card matched this account email.");
+        return;
+      }
+
+      setAccountMembershipCard(matchedMember);
+      setAccountMembershipMessage("");
+    } catch (error) {
+      console.error("Membership card sync error:", error);
+      setAccountMembershipCard(null);
+      setAccountMembershipMessage(error?.message || "Membership card sync failed.");
+    } finally {
+      setAccountMembershipLoading(false);
+    }
+  }, [accountMembershipEmail, authUser, membershipApiUrl]);
   const shouldShowAuthGate =
     !isEventDisplayMode && isFirebaseConfigured() && authReady && !authUser;
   const shouldShowStudentShell =
@@ -5839,6 +6249,16 @@ const uspsaStageRankings = uspsaStageLeaderboardRaw
 
     loadStudentAccounts();
   }, [authUser, hasAdminAccess, loadStudentAccounts]);
+
+  useEffect(() => {
+    if (!authUser || !authReady || isEventDisplayMode) {
+      setAccountMembershipCard(null);
+      setAccountMembershipMessage("");
+      return;
+    }
+
+    loadAccountMembershipCard();
+  }, [authReady, authUser, isEventDisplayMode, loadAccountMembershipCard]);
 
   const boxStyle = {
   background: theme.cardBg,
@@ -5975,6 +6395,298 @@ const infoPillStyle = {
   background: theme.cardBgSoft,
   color: theme.text,
 };
+
+const openAccountMembershipQr = (event) => {
+  event?.stopPropagation?.();
+
+  setAccountMembershipQrOpen(true);
+
+  window.requestAnimationFrame(() => {
+    document.getElementById("account-membership-large-qr")?.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  if (!accountMembershipCard?.cardId && !accountMembershipLoading) {
+    loadAccountMembershipCard();
+  }
+};
+
+const myQrButtonStyle = {
+  ...buttonStyle,
+  minHeight: 42,
+  padding: "9px 14px",
+  fontSize: 14,
+  borderRadius: 999,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 8,
+};
+
+const accountMembershipQrButton = (
+  <button
+    type="button"
+    style={myQrButtonStyle}
+    onClick={openAccountMembershipQr}
+    onPointerUp={openAccountMembershipQr}
+    disabled={accountMembershipLoading}
+  >
+    <CreditCard size={18} />
+    {accountMembershipLoading ? "Syncing..." : "My QR"}
+  </button>
+);
+
+const accountMembershipCardPanel = (
+  <div
+    style={{
+      ...boxStyle,
+      position: "relative",
+      overflow: "hidden",
+      display: "grid",
+      gap: 14,
+      background: "linear-gradient(145deg, rgba(24,24,28,0.98), rgba(10,10,12,0.98))",
+    }}
+  >
+    <img
+      src={jmTrainingLogo}
+      alt=""
+      aria-hidden="true"
+      style={{
+        position: "absolute",
+        right: -34,
+        top: "50%",
+        width: 210,
+        height: 210,
+        borderRadius: "50%",
+        objectFit: "cover",
+        opacity: 0.09,
+        transform: "translateY(-50%)",
+        pointerEvents: "none",
+      }}
+    />
+
+    <div style={{ position: "relative", display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+      <div>
+        <div style={sectionEyebrowStyle}>JM Training Membership</div>
+        <div style={{ fontSize: 24, fontWeight: 900, color: theme.text }}>
+          {accountMembershipCard ? "My Check-In QR" : "Membership Card"}
+        </div>
+        <div style={{ color: theme.subtext, marginTop: 6, lineHeight: 1.45 }}>
+          {accountMembershipCard
+            ? "Show this QR code at check-in."
+            : accountMembershipMessage || "Sync your member card from Google Sheets."}
+        </div>
+      </div>
+      <button
+        type="button"
+        style={{ ...secondaryButtonStyle, minHeight: 42, padding: "9px 12px", fontSize: 13 }}
+        onClick={accountMembershipCard?.cardId ? openAccountMembershipQr : loadAccountMembershipCard}
+        onPointerUp={accountMembershipCard?.cardId ? openAccountMembershipQr : undefined}
+        disabled={accountMembershipLoading}
+      >
+        {accountMembershipLoading ? "Syncing..." : accountMembershipCard?.cardId ? "Open QR" : "Sync Card"}
+      </button>
+    </div>
+
+    {accountMembershipCard ? (
+      <div
+        style={{
+          position: "relative",
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 1fr) 134px",
+          gap: 14,
+          alignItems: "center",
+          padding: 14,
+          borderRadius: 18,
+          border: "1px solid rgba(200,163,106,0.45)",
+          background:
+            "radial-gradient(circle at 14% 0%, rgba(200,163,106,0.22), transparent 36%), rgba(255,255,255,0.04)",
+        }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <div style={{ color: theme.text, fontSize: 22, fontWeight: 900, lineHeight: 1.1 }}>
+            {accountMembershipCard.name || authProfile?.displayName || authUser?.displayName || "Member"}
+          </div>
+          <div style={{ color: "#c8a36a", fontWeight: 900, marginTop: 6 }}>
+            {formatMembershipTier(accountMembershipCard.membership)} Membership
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginTop: 12 }}>
+            <div style={infoPillStyle}>
+              <strong>Status</strong>
+              <br />
+              {accountMembershipCard.status || "-"}
+            </div>
+            <div style={infoPillStyle}>
+              <strong>Join Date</strong>
+              <br />
+              {accountMembershipCard.joinDate || "-"}
+            </div>
+            <div style={{ ...infoPillStyle, gridColumn: "1 / -1" }}>
+              <strong>Card ID</strong>
+              <br />
+              {accountMembershipCard.cardId || "-"}
+            </div>
+          </div>
+        </div>
+        {accountMembershipCard.cardId ? (
+          <img
+            src={buildMembershipQrUrl(accountMembershipCard.cardId)}
+            alt={`${accountMembershipCard.name || "Member"} check-in QR code`}
+            style={{
+              width: 134,
+              height: 134,
+              background: "#fff",
+              borderRadius: 12,
+              padding: 7,
+              boxSizing: "border-box",
+            }}
+          />
+        ) : null}
+      </div>
+    ) : accountMembershipMessage ? (
+      <div
+        style={{
+          position: "relative",
+          padding: "12px 14px",
+          borderRadius: 14,
+          border: `1px solid ${theme.border}`,
+          background: theme.cardBgSoft,
+          color: theme.subtext,
+          fontSize: 13,
+          fontWeight: 700,
+          lineHeight: 1.45,
+        }}
+      >
+        {accountMembershipMessage}
+      </div>
+    ) : null}
+  </div>
+);
+
+const accountMembershipQrInlinePanel = accountMembershipQrOpen
+  ? (
+      <div
+        id="account-membership-large-qr"
+        style={{
+          ...boxStyle,
+          position: "relative",
+          overflow: "hidden",
+          display: "grid",
+          gap: 16,
+          background:
+            "radial-gradient(circle at 16% 0%, rgba(200,163,106,0.24), transparent 38%), linear-gradient(145deg, #16120e, #050505)",
+          color: "#f7f1e5",
+        }}
+      >
+        <img
+          src={jmTrainingLogo}
+          alt=""
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            right: -48,
+            top: -48,
+            width: 190,
+            height: 190,
+            objectFit: "cover",
+            borderRadius: "50%",
+            opacity: 0.12,
+            pointerEvents: "none",
+          }}
+        />
+        <div style={{ position: "relative", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 14 }}>
+          <div>
+            <div style={{ ...sectionEyebrowStyle, color: "#c8a36a", opacity: 1 }}>JM Training</div>
+            <div style={{ fontSize: 30, fontWeight: 900, lineHeight: 1.05 }}>
+              My QR
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setAccountMembershipQrOpen(false)}
+            style={{
+              ...secondaryButtonStyle,
+              minHeight: 40,
+              padding: "8px 12px",
+              color: "#f7f1e5",
+            }}
+          >
+            Close
+          </button>
+        </div>
+
+        {accountMembershipCard?.cardId ? (
+          <div style={{ position: "relative", display: "grid", gap: 16, textAlign: "center" }}>
+            <div>
+              <div style={{ fontSize: 24, fontWeight: 900, lineHeight: 1.1 }}>
+                {accountMembershipCard.name || authProfile?.displayName || authUser?.displayName || "Member"}
+              </div>
+              <div style={{ color: "#c8a36a", fontWeight: 900, marginTop: 6 }}>
+                {formatMembershipTier(accountMembershipCard.membership)} Membership
+              </div>
+            </div>
+
+            <div
+              style={{
+                margin: "0 auto",
+                padding: 12,
+                borderRadius: 24,
+                background: "#fff",
+                boxShadow: "0 18px 48px rgba(0,0,0,0.34)",
+              }}
+            >
+              <img
+                src={buildMembershipQrUrl(accountMembershipCard.cardId)}
+                alt={`${accountMembershipCard.name || "Member"} check-in QR code`}
+                style={{
+                  display: "block",
+                  width: "min(72vw, 290px)",
+                  height: "min(72vw, 290px)",
+                }}
+              />
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+              <div style={{ ...infoPillStyle, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
+                <strong>Status</strong>
+                <br />
+                {accountMembershipCard.status || "-"}
+              </div>
+              <div style={{ ...infoPillStyle, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
+                <strong>Card ID</strong>
+                <br />
+                {accountMembershipCard.cardId || "-"}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ position: "relative", display: "grid", gap: 14 }}>
+            <div
+              style={{
+                padding: 16,
+                borderRadius: 18,
+                background: "rgba(255,255,255,0.06)",
+                border: "1px solid rgba(255,255,255,0.12)",
+                color: "#dbc7a1",
+                lineHeight: 1.45,
+              }}
+            >
+              {accountMembershipMessage || "Loading your membership card..."}
+            </div>
+            <button
+              type="button"
+              style={buttonStyle}
+              onClick={loadAccountMembershipCard}
+              disabled={accountMembershipLoading}
+            >
+              {accountMembershipLoading ? "Syncing Card..." : "Sync Card"}
+            </button>
+          </div>
+        )}
+      </div>
+    )
+  : null;
 
 const tableHeaderCellStyle = {
   textAlign: "left",
@@ -6277,6 +6989,75 @@ const getRowStyle = (index) => ({
     ];
 
     return (
+      <PullToRefresh
+        className="app-pull-refresh"
+        pullDownThreshold={82}
+        maxPullDownDistance={126}
+        resistance={1.85}
+        backgroundColor="#050505"
+        onRefresh={async () => {
+          if (Capacitor.isNativePlatform()) {
+            try {
+              await Haptics.impact({ style: ImpactStyle.Light });
+            } catch {
+              // Ignore haptic issues on unsupported devices.
+            }
+          }
+
+          await Promise.all([load(), loadAccountMembershipCard(), wait(420)]);
+        }}
+        pullingContent={
+          <div
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "10px 16px",
+              borderRadius: 999,
+              background: theme.cardBgSoft,
+              border: `1px solid ${theme.border}`,
+              color: theme.subtext,
+              fontSize: 14,
+              fontWeight: 700,
+              letterSpacing: 0.2,
+              boxShadow: "0 10px 24px rgba(0, 0, 0, 0.18)",
+            }}
+          >
+            <span
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: "50%",
+                background: "#c8a36a",
+                opacity: 0.9,
+                boxShadow: "0 0 0 4px rgba(200, 163, 106, 0.14)",
+              }}
+            />
+            Pull to refresh
+          </div>
+        }
+        refreshingContent={
+          <div
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "10px 16px",
+              borderRadius: 999,
+              background: theme.cardBgSoft,
+              border: `1px solid ${theme.border}`,
+              color: "#c8a36a",
+              fontSize: 14,
+              fontWeight: 800,
+              letterSpacing: 0.2,
+              boxShadow: "0 10px 24px rgba(0, 0, 0, 0.2)",
+            }}
+          >
+            <span className="app-refresh-spinner" />
+            Refreshing...
+          </div>
+        }
+      >
       <div
         style={{
           minHeight: "100vh",
@@ -6372,6 +7153,7 @@ const getRowStyle = (index) => ({
               </div>
 
               <div style={{ display: "grid", gap: 10, minWidth: 150 }}>
+                {accountMembershipQrButton}
                 <div style={{ ...infoPillStyle, textAlign: "center", background: "rgba(255,255,255,0.04)" }}>
                   <strong>Last Run</strong>
                   <br />
@@ -6383,6 +7165,8 @@ const getRowStyle = (index) => ({
               </div>
             </div>
           </div>
+
+          {accountMembershipQrInlinePanel}
 
           {!linkedStudentShooterId ? (
             <div style={{ ...boxStyle, color: theme.subtext, lineHeight: 1.6, display: "grid", gap: 14 }}>
@@ -6820,6 +7604,7 @@ const getRowStyle = (index) => ({
             )
           : null}
       </div>
+      </PullToRefresh>
     );
   }
 
@@ -7144,15 +7929,24 @@ async function finalizeRun() {
 
     const drill = findItemById(drillsRef.current, selectedDrillRef.current, "DrillID");
     const passTime = Number(drill?.PassTime || 0);
+    const minScore = Number(drill?.MinScore || 0);
+    const currentScoreValue = Number(score || 0);
 
     let scoreValue = "";
     let computedPassFail = "";
 
-    if (passTime > 0) {
+    if (minScore > 0) {
+      scoreValue = Number.isFinite(currentScoreValue) ? currentScoreValue : "";
+    } else if (passTime > 0) {
       const overPar = Math.max(0, totalTime - passTime);
       const deductionSteps = Math.ceil(overPar / 0.1);
       scoreValue = Math.max(0, 100 - deductionSteps * 5);
-      computedPassFail = totalTime <= passTime ? "Pass" : "Fail";
+    }
+
+    if (passTime > 0 || minScore > 0) {
+      const timePass = passTime ? totalTime <= passTime : true;
+      const scorePass = minScore ? currentScoreValue >= minScore : true;
+      computedPassFail = timePass && scorePass ? "Pass" : "Fail";
     }
 
     const manualQualification = qualificationLevel || "";
@@ -7308,7 +8102,11 @@ async function finalizeRun() {
         discardPending: false,
         recordedMeta: null,
       };
-      handleMatchRunSaved(run);
+      if (activeQualificationRef.current?.mode === "single-stage") {
+        handleQualificationRunSaved(run);
+      } else {
+        handleMatchRunSaved(run);
+      }
       await load();
     } else {
       const errorText =
@@ -8852,10 +9650,9 @@ async function autoReconnectTimer() {
             )}
           </div>
         </div>
-
-        {activeRunVideo
-          ? createPortal(
-              <div
+          {activeRunVideo
+            ? createPortal(
+                <div
                 onClick={closeRunVideoPlayer}
                 style={{
                   position: "fixed",
@@ -9559,6 +10356,7 @@ async function autoReconnectTimer() {
         </div>
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {accountMembershipQrButton}
           {hasAdminAccess ? (
             <button
               type="button"
@@ -9597,6 +10395,8 @@ async function autoReconnectTimer() {
           {studentAccountMessage}
         </div>
       ) : null}
+
+      {accountMembershipQrInlinePanel}
 
       {hasAdminAccess ? (
       <div style={{ display: "grid", gap: 14 }}>
@@ -10187,7 +10987,9 @@ async function autoReconnectTimer() {
               {activeQualification?.name || selectedDrillData?.DrillName || "Qualification"}
             </div>
             <div style={{ color: theme.subtext, marginTop: 6, lineHeight: 1.45 }}>
-              Everyone shoots the same distance together, then you enter each score before advancing to the next distance.
+              {activeQualificationIsSingleStage || selectedQualificationIsSingleStage
+                ? "Build a qualification roster, then the app will auto-load each shooter and record one qualification run per shooter."
+                : "Everyone shoots the same distance together, then you enter each score before advancing to the next distance."}
             </div>
           </div>
 
@@ -10220,48 +11022,63 @@ async function autoReconnectTimer() {
           {!activeQualification ? (
             <>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 10 }}>
+                {!selectedQualificationIsSingleStage ? (
+                  <div style={infoPillStyle}>
+                    <strong>Distances</strong>
+                    <br />
+                    {qualificationDistances.length}
+                  </div>
+                ) : null}
                 <div style={infoPillStyle}>
-                  <strong>Distances</strong>
+                  <strong>{selectedQualificationIsSingleStage ? "Pass Rule" : "Stage Pass"}</strong>
                   <br />
-                  {qualificationDistances.length}
-                </div>
-                <div style={infoPillStyle}>
-                  <strong>Stage Pass</strong>
-                  <br />
-                  {selectedQualificationPreviewTarget > 0
+                  {selectedQualificationIsSingleStage
+                    ? ([
+                        Number(selectedQualificationConfig?.passTime || 0) > 0
+                          ? `Time ≤ ${Number(selectedQualificationConfig?.passTime || 0).toFixed(2)}s`
+                          : "",
+                        Number(selectedQualificationConfig?.passScore || 0) > 0
+                          ? `Score ≥ ${Number(selectedQualificationConfig?.passScore || 0)}`
+                          : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" • ") || "Manual review")
+                    : selectedQualificationPreviewTarget > 0
                     ? `${Math.ceil(selectedQualificationPreviewTarget * (selectedQualificationPassPercent / 100))}/${selectedQualificationPreviewTarget} (${selectedQualificationPassPercent}%)`
                     : `${selectedQualificationPassPercent}% per distance`}
                 </div>
               </div>
 
-              <div style={{ ...tableContainerStyle, padding: 16 }}>
-                <div style={{ fontSize: 18, fontWeight: 800, color: theme.text, marginBottom: 10 }}>
-                  Qualification Distances
-                </div>
-                <div style={{ display: "grid", gap: 8 }}>
-                  {qualificationDistances.map((distance, index) => (
-                    <div
-                      key={`qualification-distance-${index}`}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "70px minmax(0, 1fr) auto",
-                        gap: 12,
-                        alignItems: "center",
-                        padding: "10px 12px",
-                        borderRadius: 14,
-                        border: `1px solid ${theme.border}`,
-                        background: theme.cardBgSoft,
-                      }}
-                    >
-                      <div style={{ color: theme.accent, fontWeight: 900 }}>{index + 1}</div>
-                      <div style={{ color: theme.text, fontWeight: 800 }}>{distance.label}</div>
-                      <div style={{ color: theme.subtext, fontSize: 13, fontWeight: 700 }}>
-                        {distance.roundCount ? `${distance.roundCount} rds` : "Rounds not set"}
+              {!selectedQualificationIsSingleStage ? (
+                <div style={{ ...tableContainerStyle, padding: 16 }}>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: theme.text, marginBottom: 10 }}>
+                    Qualification Distances
+                  </div>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {qualificationDistances.map((distance, index) => (
+                      <div
+                        key={`qualification-distance-${index}`}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "70px minmax(0, 1fr) auto",
+                          gap: 12,
+                          alignItems: "center",
+                          padding: "10px 12px",
+                          borderRadius: 14,
+                          border: `1px solid ${theme.border}`,
+                          background: theme.cardBgSoft,
+                        }}
+                      >
+                        <div style={{ color: theme.accent, fontWeight: 900 }}>{index + 1}</div>
+                        <div style={{ color: theme.text, fontWeight: 800 }}>{distance.label}</div>
+                        <div style={{ color: theme.subtext, fontSize: 13, fontWeight: 700 }}>
+                          {distance.roundCount ? `${distance.roundCount} rds` : "Rounds not set"}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
-              </div>
+              ) : null}
 
               <div style={{ ...tableContainerStyle, padding: 16 }}>
                 <div style={{ fontSize: 18, fontWeight: 800, color: theme.text, marginBottom: 10 }}>
@@ -10362,6 +11179,105 @@ async function autoReconnectTimer() {
             </>
           ) : (
             <>
+              {activeQualificationIsSingleStage ? (
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 14 }}>
+                    <div style={infoPillStyle}><strong>Qualification:</strong><br />{activeQualification.name}</div>
+                    <div style={infoPillStyle}><strong>Drill:</strong><br />{findItemById(drills, activeQualification.drillId, "DrillID")?.DrillName || activeQualification.drillId}</div>
+                    <div style={infoPillStyle}><strong>Session:</strong><br />{findItemById(sessions, activeQualification.sessionId, "SessionID")?.SessionName || activeQualification.sessionId}</div>
+                    <div style={infoPillStyle}><strong>Progress:</strong><br />{Math.min((activeQualification.currentIndex || 0) + 1, activeQualification.shooterIds.length)} / {activeQualification.shooterIds.length}</div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
+                    <div style={{ ...tableContainerStyle, padding: 18 }}>
+                      <div style={sectionEyebrowStyle}>Now Up</div>
+                      <div style={{ fontSize: 28, fontWeight: 900, color: theme.text }}>
+                        {activeQualificationCurrentShooter?.Name || "Done"}
+                      </div>
+                    </div>
+                    <div style={{ ...tableContainerStyle, padding: 18 }}>
+                      <div style={sectionEyebrowStyle}>On Deck</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: theme.text }}>
+                        {activeQualificationNextShooter?.Name || "No one"}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    <button type="button" style={buttonStyle} onClick={() => setActiveTab("timer")}>
+                      <Play size={18} /> Open Timer
+                    </button>
+                    <button type="button" style={secondaryButtonStyle} onClick={skipCurrentQualificationShooter}>
+                      <SkipForward size={18} /> Skip Shooter
+                    </button>
+                    <button type="button" style={secondaryButtonStyle} onClick={() => finishQualification()}>
+                      <CheckCircle2 size={18} /> Finish Qualification
+                    </button>
+                  </div>
+
+                  <div style={{ ...tableContainerStyle, padding: 16 }}>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: theme.text, marginBottom: 10 }}>
+                      Qualification Roster
+                    </div>
+                    <div style={{ display: "grid", gap: 10 }}>
+                      {activeQualification.shooterIds.map((shooterId, index) => {
+                        const shooter = findItemById(shooters, shooterId, "ShooterID");
+                        const result = (activeQualification.results || []).find(
+                          (entry) => String(entry.shooterId) === String(shooterId)
+                        );
+                        const isCurrent = index === activeQualification.currentIndex;
+                        return (
+                          <div
+                            key={`active-qualification-${shooterId}`}
+                            style={{
+                              display: "grid",
+                              gridTemplateColumns: "56px minmax(0, 1fr) auto",
+                              gap: 10,
+                              alignItems: "center",
+                              padding: 12,
+                              borderRadius: 14,
+                              background: isCurrent ? theme.accentSoft : theme.cardBgSoft,
+                              border: `1px solid ${isCurrent ? theme.accent : theme.border}`,
+                            }}
+                          >
+                            <div style={{ fontSize: 18, fontWeight: 800, color: theme.accent, textAlign: "center" }}>
+                              {index + 1}
+                            </div>
+                            <div>
+                              <div style={{ color: theme.text, fontWeight: 800, fontSize: 18 }}>
+                                {shooter?.Name || shooterId}
+                              </div>
+                              <div style={{ color: theme.subtext, fontSize: 14 }}>
+                                {result ? `Saved ${result.totalTime || "—"}s • ${result.passFail || "Scored"}` : isCurrent ? "Current shooter" : "Waiting"}
+                              </div>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+                              <div style={{ color: result ? theme.successText : isCurrent ? theme.accent : theme.subtext, fontWeight: 800 }}>
+                                {result ? "Done" : isCurrent ? "Up" : "Queued"}
+                              </div>
+                              {!isCurrent ? (
+                                <button
+                                  type="button"
+                                  style={{
+                                    ...secondaryButtonStyle,
+                                    padding: "8px 12px",
+                                    fontSize: 13,
+                                    whiteSpace: "nowrap",
+                                  }}
+                                  onClick={() => setCurrentQualificationShooter(shooterId)}
+                                >
+                                  Set Current
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 10 }}>
                 <div style={infoPillStyle}>
                   <strong>Distance</strong>
@@ -10599,6 +11515,8 @@ async function autoReconnectTimer() {
                   End Qualification
                 </button>
               </div>
+                </>
+              )}
             </>
           )}
         </div>
