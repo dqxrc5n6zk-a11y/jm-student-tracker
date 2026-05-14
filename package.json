@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "mac": "vite --host 0.0.0.0 --open",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
@@ -18,6 +19,7 @@
     "@capacitor/ios": "^8.3.0",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.6.0",
+    "@zxing/browser": "^0.2.0",
     "firebase": "^12.12.0",
     "lucide-react": "^1.8.0",
     "pdfjs-dist": "^5.4.296",

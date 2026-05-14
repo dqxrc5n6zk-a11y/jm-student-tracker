@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BrowserQRCodeReader } from "@zxing/browser";
 import {
   BadgeCheck,
   Camera,
@@ -189,7 +190,8 @@ function makeBlankMember() {
 
 export default function MembershipCheckInApp() {
   const videoRef = useRef(null);
-  const scanLoopRef = useRef(null);
+  const scannerControlsRef = useRef(null);
+  const scanResolvedRef = useRef(false);
   const streamRef = useRef(null);
   const apiFromEnv = String(import.meta.env.VITE_MEMBERSHIP_API_BASE || "").trim();
   const [apiUrl, setApiUrl] = useState(() => localStorage.getItem(API_STORAGE_KEY) || apiFromEnv);
@@ -360,8 +362,7 @@ export default function MembershipCheckInApp() {
 
   useEffect(() => {
     return () => {
-      window.cancelAnimationFrame(scanLoopRef.current);
-      streamRef.current?.getTracks().forEach((track) => track.stop());
+      stopScanner();
     };
   }, []);
 
@@ -447,51 +448,49 @@ export default function MembershipCheckInApp() {
   }
 
   async function startScanner() {
-    if (!("BarcodeDetector" in window)) {
-      setSyncStatus("Camera QR scanning is not supported in this browser. Use the scan box instead.");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setSyncStatus("Camera access is not supported in this browser. Use Safari over HTTPS or the scan box instead.");
       return;
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
-        audio: false,
-      });
-      streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play();
+      scanResolvedRef.current = false;
       setScannerActive(true);
-      setSyncStatus("Camera scanner is running.");
+      setSyncStatus("Starting camera scanner...");
 
-      const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
-      const tick = async () => {
-        if (!videoRef.current || videoRef.current.readyState < 2) {
-          scanLoopRef.current = window.requestAnimationFrame(tick);
-          return;
+      const reader = new BrowserQRCodeReader();
+      const controls = await reader.decodeFromConstraints(
+        {
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        },
+        videoRef.current,
+        async (result) => {
+          const rawCode = result?.getText?.();
+          if (!rawCode || scanResolvedRef.current) return;
+
+          scanResolvedRef.current = true;
+          stopScanner();
+          await handleScan(rawCode);
         }
+      );
 
-        try {
-          const codes = await detector.detect(videoRef.current);
-          if (codes[0]?.rawValue) {
-            stopScanner();
-            await handleScan(codes[0].rawValue);
-            return;
-          }
-        } catch {
-          setSyncStatus("Point the camera at the member QR code.");
-        }
-
-        scanLoopRef.current = window.requestAnimationFrame(tick);
-      };
-
-      scanLoopRef.current = window.requestAnimationFrame(tick);
+      scannerControlsRef.current = controls;
+      streamRef.current = videoRef.current?.srcObject;
+      setSyncStatus("Camera scanner is running. Point the iPad at a member QR code.");
     } catch (error) {
+      stopScanner();
       setSyncStatus(error?.message || "Could not start the camera scanner.");
     }
   }
 
   function stopScanner() {
-    window.cancelAnimationFrame(scanLoopRef.current);
+    scannerControlsRef.current?.stop();
+    scannerControlsRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (videoRef.current) {
